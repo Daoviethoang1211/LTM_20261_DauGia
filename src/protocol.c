@@ -77,13 +77,13 @@ json_object *protocol_error(json_object *id, const char *code) {
     json_object_object_add(reply, "error_code", json_object_new_string(code));
     return reply;
 }
-json_object *protocol_handle(const unsigned char *body, size_t length, long long starts) {
-    if (!valid_utf8(body, length)) return protocol_error(NULL, "INVALID_JSON");
+json_object *protocol_parse(const unsigned char *body, size_t length) {
+    if (length > 65536 || !valid_utf8(body, length)) return NULL;
     size_t parse_length = 0;
     char *parse_body = ascii_json(body, length, &parse_length);
-    if (!parse_body) return protocol_error(NULL, parse_length == (size_t)-1 ? "INVALID_JSON" : "INTERNAL_ERROR");
+    if (!parse_body) return NULL;
     json_tokener *tok = json_tokener_new();
-    if (!tok) { free(parse_body); return protocol_error(NULL, "INTERNAL_ERROR"); }
+    if (!tok) { free(parse_body); return NULL; }
     json_tokener_set_flags(tok, JSON_TOKENER_STRICT);
     json_object *request = json_tokener_parse_ex(tok, parse_body, (int)parse_length);
     size_t end = json_tokener_get_parse_end(tok);
@@ -93,8 +93,20 @@ json_object *protocol_handle(const unsigned char *body, size_t length, long long
     free(parse_body);
     if (!valid || end != parse_length || !json_object_is_type(request, json_type_object) || !finite_numbers(request)) {
         json_object_put(request);
-        return protocol_error(NULL, "INVALID_JSON");
+        return NULL;
     }
+    return request;
+}
+json_object *protocol_success(json_object *id, json_object *data) {
+    json_object *reply = json_object_new_object();
+    json_object_object_add(reply, "request_id", json_object_get(id));
+    json_object_object_add(reply, "ok", json_object_new_boolean(1));
+    json_object_object_add(reply, "data", data);
+    return reply;
+}
+json_object *protocol_handle(const unsigned char *body, size_t length, long long starts) {
+    json_object *request = protocol_parse(body, length);
+    if (!request) return protocol_error(NULL, "INVALID_JSON");
     json_object *id = NULL, *type = NULL, *payload = NULL, *reply;
     json_object_object_get_ex(request, "request_id", &id);
     json_object_object_get_ex(request, "type", &type);

@@ -1,6 +1,7 @@
 #include "frame.h"
 #include "protocol.h"
 #include "storage.h"
+#include "app.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -13,10 +14,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLIENT_MAX 64
+#define CLIENT_MAX APP_CLIENT_MAX
 #define OUTPUT_MAX (4 * (FRAME_MAX + 4))
 typedef struct {
-    int fd, draining;
+    int fd, draining, failed, slot;
+    App *app;
     size_t received, queued;
     unsigned char input[FRAME_MAX + 4], output[OUTPUT_MAX];
     double progress;
@@ -43,23 +45,58 @@ static int nonblocking(int fd) {
 static void disconnect(Client *c) {
     log_event("disconnect", c->fd);
     close(c->fd); c->fd = -1;
+    app_disconnect(c->app, c->slot);
 }
 static int enqueue(Client *c, json_object *reply) {
     const char *body = json_object_to_json_string_ext(reply, JSON_C_TO_STRING_PLAIN);
     size_t length = strlen(body);
     if (length > FRAME_MAX) {
+        json_object *id = NULL;
+        json_object_object_get_ex(reply, "request_id", &id);
+        if (id) json_object_get(id);
         json_object_put(reply);
-        reply = protocol_error(NULL, "RESPONSE_TOO_LARGE");
+        /* Oversized responses cannot be queued, but still correlate the error. */
+        reply = protocol_error(id, "RESPONSE_TOO_LARGE");
+        json_object_put(id);
         body = json_object_to_json_string_ext(reply, JSON_C_TO_STRING_PLAIN);
         length = strlen(body);
     }
     if (c->queued + length + 4 > OUTPUT_MAX) {
         json_object_put(reply); log_event("slow_client", c->fd); return -1;
     }
+    if (!c->queued) c->progress = now();
     frame_header(c->output + c->queued, (uint32_t)length);
     memcpy(c->output + c->queued + 4, body, length);
     c->queued += length + 4;
     json_object_put(reply);
+    return 0;
+}
+static void emit(void *context, int slot, json_object *message) {
+    Client *clients = context;
+    if (clients[slot].fd < 0) { json_object_put(message); return; }
+    if (enqueue(&clients[slot], message) < 0) clients[slot].failed = 1;
+}
+static int process_frames(Client *c, long long starts) {
+    size_t consumed = 0;
+    while (!c->app->sessions[c->slot].pending && c->received - consumed >= 4) {
+        uint32_t length = frame_length(c->input + consumed);
+        if (!length || length > FRAME_MAX) {
+            log_event("invalid_frame_size", c->fd);
+            c->draining = 1; c->received = 0;
+            return enqueue(c, protocol_error(NULL, "INVALID_FRAME_SIZE"));
+        }
+        if (c->received - consumed < length + 4u) break;
+        json_object *reply = app_handle(c->app, c->slot, c->input + consumed + 4, length, starts);
+        if (reply) {
+            json_object *ok = NULL;
+            json_object_object_get_ex(reply, "ok", &ok);
+            log_event(json_object_get_boolean(ok) ? "request_ok" : "request_rejected", c->fd);
+            if (enqueue(c, reply) < 0) return -1;
+        }
+        consumed += length + 4u;
+    }
+    c->received -= consumed;
+    memmove(c->input, c->input + consumed, c->received);
     return 0;
 }
 static int receive_frames(Client *c, long long starts) {
@@ -71,25 +108,7 @@ static int receive_frames(Client *c, long long starts) {
     }
     if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
     c->received += (size_t)n; c->progress = now();
-    size_t consumed = 0;
-    while (c->received - consumed >= 4) {
-        uint32_t length = frame_length(c->input + consumed);
-        if (!length || length > FRAME_MAX) {
-            log_event("invalid_frame_size", c->fd);
-            c->draining = 1; c->received = 0;
-            return enqueue(c, protocol_error(NULL, "INVALID_FRAME_SIZE"));
-        }
-        if (c->received - consumed < length + 4u) break;
-        json_object *reply = protocol_handle(c->input + consumed + 4, length, starts);
-        json_object *ok = NULL;
-        json_object_object_get_ex(reply, "ok", &ok);
-        log_event(json_object_get_boolean(ok) ? "request_ok" : "request_rejected", c->fd);
-        if (enqueue(c, reply) < 0) return -1;
-        consumed += length + 4u;
-    }
-    c->received -= consumed;
-    memmove(c->input, c->input + consumed, c->received);
-    return 0;
+    return process_frames(c, starts);
 }
 static int flush(Client *c) {
     ssize_t n = send(c->fd, c->output, c->queued, MSG_NOSIGNAL);
@@ -116,6 +135,11 @@ int main(int argc, char **argv) {
     Client *clients = calloc(CLIENT_MAX, sizeof *clients);
     if (!clients) { sqlite3_close(db); if (listener >= 0) close(listener); return 1; }
     for (int i = 0; i < CLIENT_MAX; i++) clients[i].fd = -1;
+    App app;
+    if (app_start(&app, db, emit, clients) < 0) {
+        fprintf(stderr, "auth worker initialization failed\n");
+        free(clients); if (listener >= 0) close(listener); sqlite3_close(db); return 1;
+    }
     if (listener < 0) goto cleanup;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
     if (nonblocking(listener) < 0 || bind(listener, (struct sockaddr *)&address, sizeof address) < 0 || listen(listener, 64) < 0) {
@@ -127,10 +151,16 @@ int main(int argc, char **argv) {
     log_event("server_started", listener);
     result = 0;
     while (!stopped) {
+        app_collect(&app);
+        for (int i = 0; i < CLIENT_MAX; i++) {
+            Client *c = &clients[i];
+            if (c->fd < 0) continue;
+            if (c->failed || (!c->draining && process_frames(c, starts) < 0)) disconnect(c);
+        }
         struct pollfd fds[CLIENT_MAX + 1] = {{.fd = listener, .events = POLLIN}};
         for (int i = 0; i < CLIENT_MAX; i++) {
             fds[i+1].fd = clients[i].fd;
-            fds[i+1].events = (clients[i].draining ? 0 : POLLIN) | (clients[i].queued ? POLLOUT : 0);
+            fds[i+1].events = (clients[i].draining || app.sessions[i].pending ? 0 : POLLIN) | (clients[i].queued ? POLLOUT : 0);
         }
         int ready = poll(fds, CLIENT_MAX + 1, 250);
         if (ready < 0) { if (errno == EINTR) continue; perror("poll"); result = 1; break; }
@@ -138,8 +168,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < CLIENT_MAX; i++) {
             Client *c = &clients[i]; short events = fds[i+1].revents;
             if (c->fd < 0) continue;
-            int failed = events & (POLLERR | POLLNVAL);
-            if (!failed && !c->draining && (events & (POLLIN | POLLHUP))) failed = receive_frames(c, starts) < 0;
+            int failed = c->failed || (events & (POLLERR | POLLNVAL));
+            if (!failed && !c->draining && !app.sessions[i].pending && (events & (POLLIN | POLLHUP))) failed = receive_frames(c, starts) < 0;
+            if (!failed && app.sessions[i].pending && (events & POLLHUP)) failed = 1;
             if (!failed && (events & POLLOUT) && c->queued) failed = flush(c) < 0;
             if (!failed && (c->received || c->queued || c->draining) && now() - c->progress > 10) {
                 log_event("io_timeout", c->fd); failed = 1;
@@ -155,7 +186,8 @@ int main(int argc, char **argv) {
                 for (slot = 0; slot < CLIENT_MAX && clients[slot].fd >= 0; slot++) {}
                 if (slot == CLIENT_MAX || nonblocking(fd) < 0) { log_event("connection_rejected", fd); close(fd); continue; }
                 Client *c = &clients[slot];
-                c->fd = fd; c->received = c->queued = 0; c->draining = 0; c->progress = now();
+                c->fd = fd; c->received = c->queued = 0; c->draining = c->failed = 0; c->progress = now();
+                c->slot = slot; c->app = &app; app_connect(&app, slot);
                 log_event("connect", fd);
             }
         }
@@ -163,6 +195,7 @@ int main(int argc, char **argv) {
 cleanup:
     for (int i = 0; i < CLIENT_MAX; i++) if (clients[i].fd >= 0) disconnect(&clients[i]);
     free(clients);
+    app_stop(&app);
     if (listener >= 0) close(listener);
     sqlite3_close(db);
     return result;

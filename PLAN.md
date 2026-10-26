@@ -92,9 +92,9 @@ Ví dụ: `{"type":"BID","request_id":"b123","payload":{"item_id":42,"amount_vnd
 | Mốc | Công việc | Điều kiện hoàn thành |
 | --- | --- | --- |
 | 1. Nền tảng mạng (tuần 1) | Repo/build WSL, migration nền tảng SQLite, TCP server `poll()`, client CLI C, bộ ghép khung hai phía, mã lỗi, log. Schema nghiệp vụ thêm dần ở phase sau. | 3 client đồng thời; frame chia/gộp, UTF-8, client ngắt/chậm, restart và rollback CSDL; kiểm tra bộ nhớ. Đã có code và 14 test tích hợp đạt. |
-| 2. Tài khoản và phòng (tuần 2) | Đăng ký/đăng nhập/đăng xuất, phiên, tạo/liệt kê/vào/rời phòng, phân quyền. | Không thể vào 2 phòng; request thiếu quyền bị từ chối; ngắt kết nối giải phóng phiên. |
-| 3. Vật phẩm và lõi đấu giá (tuần 3) | Chủ phòng chuẩn bị/sắp danh mục nháp, công bố; khách xem trước; lịch tự mở, trạng thái, bid, mua ngay, timer 30 giây, sự kiện, transaction và khôi phục nghiệp vụ. | Khách không thấy bản nháp/không sửa danh mục; xem trước không chiếm phòng; công bố mới mở lịch; hai client thấy cùng giá; bid/mua ngay/hết giờ không tạo kết quả trùng. |
-| 4. GUI và tra cứu (tuần 4) | Tách mạng/giao thức client thành thư viện C gọi từ Qt; màn quản lý/công bố, xem trước, đấu giá, tìm kiếm và lịch sử; mất kết nối và snapshot. | Đi hết kịch bản bằng GUI; toàn bộ kết nối/framing/JSON vẫn trong C; GUI không bị chặn khi chờ mạng. |
+| 2. Bản demo tài khoản, phòng và danh mục (tuần 2) | Đăng ký/đăng nhập/đăng xuất/đổi mật khẩu, phiên; tạo/liệt kê/xem/vào/rời phòng; chuẩn bị/sắp danh mục nháp và công bố; khách xem trước; snapshot và sự kiện thành viên; menu C giữ kết nối, thư viện mạng C dùng lại, migration v2. Phần danh mục cơ bản được đưa lên từ phase 3 theo phạm vi người dùng đã duyệt. | Demo 3 client không nhập JSON: công bố danh mục rồi khách xem/vào phòng; không vào 2 phòng; không sửa/xem nháp trái quyền; ngắt kết nối giải phóng phiên; restart giữ tài khoản/danh mục, xóa phiên; test hồi quy và bộ nhớ đạt. Chưa mở đấu giá tự động. |
+| 3. Lõi đấu giá (tuần 3) | Lịch tự mở sau công bố, trạng thái, bid, mua ngay, timer 30 giây, sự kiện đấu giá, transaction kết quả và khôi phục nghiệp vụ; mở rộng schema v2 bằng migration tiếp theo. | Hai client thấy cùng giá; bid cạnh tranh có đúng một thứ tự; mua ngay/hết giờ không tạo kết quả trùng; restart đúng chính sách được chốt. |
+| 4. GUI và tra cứu (tuần 4) | Qt gọi thư viện mạng C đã tách ở phase 2; màn quản lý/công bố, xem trước, đấu giá, tìm kiếm và lịch sử; mất kết nối và snapshot. | Đi hết kịch bản bằng GUI; toàn bộ kết nối/framing/JSON vẫn trong C; GUI không bị chặn khi chờ mạng. |
 | 5. Ổn định và trình bày (cuối tuần 4–5) | Test tích hợp, restart server, sửa race/edge case, tài liệu, ảnh giao diện, video hoặc script demo. | Chạy lại toàn bộ checklist rubric trên máy sạch theo README. |
 
 **Chia việc nếu 3 người:** (A) server socket/giao thức/phiên, (B) CSDL và nghiệp vụ đấu giá/timer, (C) Qt GUI. Cả nhóm cùng chốt `protocol.md` và schema trước khi làm song song; tích hợp mỗi ngày, không để tới cuối mới nối client với server.
@@ -131,7 +131,7 @@ Quy ước triển khai cho bản cơ bản: chủ phòng là người tổ ch�
 
 Cần chốt trước phase liên quan:
 
-1. Trước phase 2: chính sách nhiều lần đăng nhập cùng tài khoản và thư viện băm mật khẩu.
+1. Đã chốt cho phase 2: một tài khoản chỉ có một kết nối đăng nhập; lần đăng nhập thứ hai bị từ chối. Dùng libsodium Argon2id, một worker băm mật khẩu với tối đa 16 yêu cầu đang chờ/xử lý/hoàn tất; DB và phiên chỉ do event loop cập nhật. Chi tiết phạm vi phase 2 và demo: [docs/phase2.md](docs/phase2.md).
 2. Trước phase 3: chi tiết lịch (hiện giữ `planned_start_at` và `duration_sec`), khoảng công bố trước giờ mở, chính sách khi restart đang đấu giá và cho phép sửa/hủy sau công bố nếu cần.
 3. Trước khi ghi thống kê ở phase 3: “tham gia” tính theo xem/vào phòng hay đã bid; người chỉ xem có được tính thắng/thua không.
 
